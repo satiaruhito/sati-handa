@@ -1,0 +1,1120 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>はんだ付けチャレンジ</title>
+<meta name="description" content="長押しで、はんだを盛る。ぴったりで離す。それだけ。ブラウザですぐ遊べるはんだ付けゲーム。">
+<meta name="theme-color" content="#17181b">
+<meta property="og:type" content="website">
+<meta property="og:title" content="はんだ付けチャレンジ">
+<meta property="og:description" content="長押しで、はんだを盛る。ぴったりで離す。それだけ。LEDは光るか？">
+<meta property="og:url" content="https://satiaruhito.github.io/sati-handa/">
+<meta property="og:image" content="https://satiaruhito.github.io/sati-handa/ogp.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<style>
+  html, body { margin: 0; height: 100%; background: #17181b; overflow: hidden; }
+  canvas {
+    display: block; width: 100vw; height: 100vh; height: 100dvh;
+    touch-action: none; user-select: none; -webkit-user-select: none;
+    -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent;
+    cursor: pointer;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+
+// ---------- 画面 ----------
+const W = 600, H = 800;               // 仮想ステージ
+const cv = document.getElementById('c');
+const g = cv.getContext('2d');
+let scale = 1, ox = 0, oy = 0, dpr = 1, vw = 0, vh = 0;
+
+function resize() {
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  vw = window.innerWidth; vh = window.innerHeight;
+  cv.width = Math.round(vw * dpr); cv.height = Math.round(vh * dpr);
+  scale = Math.min(vw / W, vh / H);
+  ox = (vw - W * scale) / 2; oy = (vh - H * scale) / 2;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ---------- 基板の定義 ----------
+const FONT = '"Hiragino Kaku Gothic ProN","Yu Gothic","Meiryo",system-ui,sans-serif';
+const SILK = 'rgba(240,245,240,0.85)';
+// 基板を映す窓。cx,cy が窓の中心、fw,fh がその中に収めたい大きさ
+const VIEW = { x: 20, y: 104, w: 560, h: 422, cx: 300, cy: 315, fw: 520, fh: 410 };
+const A_MAX = 2.6;                    // ここまで行くと強制終了（焦げ）
+const SPEED = 1.2;                    // はんだが流れる速さの全体倍率（難易度のつまみ）
+
+// スマホの振動（Androidのみ。iPhoneのブラウザは非対応なので何も起きない）
+function buzz(pattern) {
+  try { if (navigator.vibrate) navigator.vibrate(pattern); } catch (e) {}
+}
+const SKIP = { x: 180, y: 714, w: 240, h: 54 };
+
+// 部品の種類ごとの性格。R: パッド半径 / rate: 流れやすさ / pre: 溶け始めるまでの秒数
+// br: このはんだ量で隣の足に届く / row: 1列の足の数
+const TYPES = {
+  P:  { jp: '練習',       R: 34, rate: [0.55, 0.85], pre: [0.25, 0.6], br: 1.6,  row: 3 },
+  R:  { jp: '抵抗',       R: 24, rate: [0.6, 0.95],  pre: [0.25, 0.6], br: 1.6,  row: 2 },
+  // コンデンサは溶け始めは他と同じ早さ。ゆっくり始まって、どんどん加速する（base 小・acc 大）
+  C:  { jp: 'コンデンサ', R: 30, rate: [0.6, 0.85],  pre: [0.25, 0.6], br: 1.6,  row: 2, base: 0.15, acc: 1.6 },
+  L:  { jp: 'LED',        R: 24, rate: [0.6, 0.95],  pre: [0.25, 0.6], br: 1.6,  row: 2 },
+  D:  { jp: '電源',       R: 24, rate: [0.6, 0.95],  pre: [0.25, 0.6], br: 1.6,  row: 2 },
+  IC: { jp: 'IC',         R: 19, rate: [0.7, 1.3],   pre: [0.2, 0.5],  br: 1.45, row: 4 },
+};
+
+function makeBoard(def) {
+  const b = Object.assign({ pads: [] }, def);
+  b.parts = def.parts.map((d, pi) => {
+    const T = TYPES[d.t], part = Object.assign({ T, pads: [] }, d);
+    let pts;
+    if (d.t === 'P') { pts = []; for (const y of [250, 400]) for (const x of [170, 300, 430]) pts.push([x, y]); }
+    else if (d.t === 'IC') { pts = []; for (const dy of [-60, 60]) for (const dx of [-93, -31, 31, 93]) pts.push([d.x + dx, d.y + dy]); }
+    else { const h = { R: 60, C: 42, L: 32, D: 35 }[d.t]; pts = [[d.x - h, d.y], [d.x + h, d.y]]; }
+    const base = b.pads.length;
+    pts.forEach(([x, y], k) => {
+      const pad = { x, y, R: T.R, br: T.br, part: pi, pin: k + 1,
+        nb: base + (k % T.row < T.row - 1 ? k + 1 : k - 1) };   // ブリッジが伸びる先（同じ部品の隣の足）
+      part.pads.push(pad); b.pads.push(pad);
+    });
+    return part;
+  });
+  return b;
+}
+
+const BOARDS = {
+  practice: makeBoard({
+    key: 'practice', label: '練習', rect: { x: 40, y: 110, w: 520, h: 410 }, focus: false, rev: 'PRACTICE BOARD',
+    col: { a: '#0f6f47', b: '#0b5f3c', c: '#084a2f', trD: '#063a25', trL: '#17935d', resist: '#06331f' },
+    parts: [{ t: 'P', name: 'CN1' }], traces: []
+  }),
+  normal: makeBoard({
+    key: 'normal', label: '本番', rect: { x: 0, y: 0, w: 900, h: 600 }, focus: true, rev: 'HANDA-CHALLENGE  REV.B',
+    col: { a: '#1f55a8', b: '#17438a', c: '#0f2e63', trD: '#0a2148', trL: '#3a7ada', resist: '#0a1f45' },
+    parts: [
+      { t: 'R', name: 'R1', x: 170, y: 130 }, { t: 'R', name: 'R2', x: 170, y: 470 },
+      { t: 'C', name: 'C1', x: 430, y: 105 }, { t: 'C', name: 'C2', x: 430, y: 495 },
+      { t: 'L', name: 'LED1', x: 730, y: 130 }, { t: 'IC', name: 'IC1', x: 480, y: 300 },
+      { t: 'D', name: 'DC IN', x: 765, y: 470 },   // 電源は最後。ここが悪いと電気が来ない
+    ],
+    traces: [
+      [[230, 130], [300, 130], [345, 175], [345, 240], [387, 240]],
+      [[388, 105], [388, 180], [449, 205], [449, 240]],
+      [[472, 105], [472, 180], [511, 205], [511, 240]],
+      [[698, 130], [640, 130], [573, 197], [573, 240]],
+      [[762, 130], [840, 130], [840, 430], [800, 470]],
+      [[110, 130], [55, 130], [55, 470], [110, 470]],
+      [[230, 470], [300, 470], [345, 425], [345, 360], [387, 360]],
+      [[388, 495], [388, 420], [449, 395], [449, 360]],
+      [[472, 495], [472, 420], [511, 395], [511, 360]],
+      [[573, 360], [573, 403], [640, 470], [730, 470]],
+    ],
+  }),
+  special: makeBoard({
+    key: 'special', label: '特殊本番', rect: { x: 0, y: 0, w: 1040, h: 640 }, focus: true, rev: 'HANDA-CHALLENGE  REV.X',
+    col: { a: '#a52a35', b: '#8a1f2a', c: '#5f141c', trD: '#3d0a10', trL: '#d65663', resist: '#3a0a0f' },
+    parts: [
+      { t: 'R', name: 'R1', x: 130, y: 150 }, { t: 'R', name: 'R2', x: 130, y: 490 },
+      { t: 'C', name: 'C1', x: 390, y: 110 }, { t: 'C', name: 'C2', x: 390, y: 530 },
+      { t: 'L', name: 'LED1', x: 700, y: 120 },
+      { t: 'IC', name: 'IC1', x: 390, y: 320 }, { t: 'IC', name: 'IC2', x: 700, y: 320 },
+      { t: 'D', name: 'DC IN', x: 900, y: 520 },
+    ],
+    traces: [
+      [[190, 150], [250, 150], [297, 197], [297, 260]],
+      [[348, 110], [348, 190], [359, 205], [359, 260]],
+      [[432, 110], [432, 190], [421, 205], [421, 260]],
+      [[483, 260], [483, 215], [607, 215], [607, 260]],
+      [[668, 120], [668, 200], [669, 260]],
+      [[732, 120], [732, 200], [731, 260]],
+      [[793, 260], [793, 200], [965, 200], [965, 480], [935, 520]],
+      [[70, 150], [35, 150], [35, 490], [70, 490]],
+      [[190, 490], [250, 490], [297, 443], [297, 380]],
+      [[348, 530], [348, 450], [359, 435], [359, 380]],
+      [[432, 530], [432, 450], [421, 435], [421, 380]],
+      [[483, 380], [483, 425], [607, 425], [607, 380]],
+      [[669, 380], [669, 460], [730, 520], [865, 520]],
+      [[731, 380], [731, 418]], [[793, 380], [793, 418]],
+    ],
+  }),
+};
+
+let board = BOARDS.practice, PADS = board.pads, N = PADS.length;
+const isPractice = () => board.key === 'practice';
+
+const KIND = {
+  none:    { label: '未はんだ',   color: '#9aa4ad' },
+  less:    { label: 'はんだ不足', color: '#ffb04a' },
+  imo:     { label: 'イモはんだ', color: '#ffb04a' },
+  good:    { label: '良品',       color: '#7dff8f' },
+  perfect: { label: '完璧！',     color: '#ffe45c' },
+  over:    { label: '盛りすぎ',   color: '#ffb04a' },
+  bridge:  { label: 'ブリッジ',   color: '#ff6a5c' },
+  burn:    { label: '焦げた',     color: '#ff6a5c' },
+};
+
+// はんだの見た目の半径。a=0.95 で銅がちょうど隠れ、a=1.12 で外側の濃い輪の縁に届く（この間が完璧）
+const solderR = (a, R) => R * 1.05 * Math.pow(Math.min(a, 2.4), 0.7);
+// 離したあと、はんだは判定どおりの形に落ち着く。境界ぎりぎりでも見た目と判定が食い違わないようにする
+function settledR(a, R, kind) {
+  const r = solderR(a, R);
+  if (kind === 'perfect') return Math.min(Math.max(r, R * 1.03), R * 1.1);   // 銅は隠れ、輪の内側
+  if (kind === 'good') return a < 1 ? Math.min(r, R * 0.92) : Math.max(r, R * 1.2);   // 銅が見える／輪からはみ出す
+  if (kind === 'over') return Math.max(r, R * 1.28);
+  return r;
+}
+
+function classify(a, br) {
+  if (a < 0.15) return ['none', 0];
+  if (a < 0.5)  return ['less', 20];
+  if (a < 0.82) return ['imo', 45];
+  if (a <= 1.18) {
+    // 完璧 = 銅が完全に隠れ、目に見えるほどはみ出していない範囲
+    if (a >= 0.95 && a <= 1.12) return ['perfect', 100];
+    const d = a < 0.95 ? 0.95 - a : a - 1.12;
+    return ['good', Math.round(95 - d / 0.13 * 15)];
+  }
+  if (a < br) return ['over', 50];
+  if (a < 2.1) return ['bridge', 15];
+  return ['burn', 0];
+}
+
+// ---------- 状態 ----------
+let state = 'title';                  // title | play | inter | result
+let joints = [], idx = 0, sub = 'ready', holdT = 0, afterT = 0;
+let resultT = 0, total = 0, rank = '', comment = '';
+let partStatus = [], ledState = 'off', diag = [], powered = false;
+let interT = 0, swapped = false, nextKey = 'normal';
+let time = 0, held = false, bannerT = 0;
+let smoke = [], popups = [];
+const iron = { x: 520, y: 700 }, wire = { x: 80, y: 60 };
+const cam = { x: 300, y: 315, z: 1 };
+
+// 結果画面の時間割（秒）：カメラが引く → 裏返す → 通電 → 結果パネル
+const T_FLIP0 = 0.7, T_FLIP1 = 1.5, T_POWER = 2.3, T_PANEL = 3.2;
+
+// 一度でも練習を終えたら、次からスキップボタンを出す
+let canSkip = false;
+try { canSkip = localStorage.getItem('handa_practiced') === '1'; } catch (e) {}
+
+// ---------- カメラ ----------
+function overviewCam() {
+  const r = board.rect;
+  return { x: r.x + r.w / 2, y: r.y + r.h / 2, z: Math.min(VIEW.fw / r.w, VIEW.fh / r.h) };
+}
+// 作業中の部品が大きく映るように寄る
+function focusCam(part) {
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (const p of part.pads) { x0 = Math.min(x0, p.x); x1 = Math.max(x1, p.x); y0 = Math.min(y0, p.y); y1 = Math.max(y1, p.y); }
+  const m = part.T.R + 60;
+  return { x: (x0 + x1) / 2, y: (y0 + y1) / 2,
+    z: Math.min(VIEW.fw / (x1 - x0 + m * 2), (VIEW.fh - 30) / (y1 - y0 + m * 2), 1.6) };
+}
+const w2s = (x, y) => [(x - cam.x) * cam.z + VIEW.cx, (y - cam.y) * cam.z + VIEW.cy];
+const curPart = () => board.parts[PADS[idx].part];
+
+function loadBoard(key) {
+  board = BOARDS[key]; PADS = board.pads; N = PADS.length;
+  joints = PADS.map(p => {
+    const T = board.parts[p.part].T, seed = [];
+    for (let k = 0; k < 9; k++) seed.push(Math.random());
+    return { a: 0, kind: null, score: 0, seed,
+      rate: T.rate[0] + Math.random() * (T.rate[1] - T.rate[0]),
+      pre: T.pre[0] + Math.random() * (T.pre[1] - T.pre[0]) };
+  });
+  idx = 0; sub = 'ready'; holdT = 0; smoke = []; popups = []; powered = false;
+  lastReleaseAt = 0; pendingWait = null;
+  Object.assign(cam, overviewCam());   // 全体が見える状態から、最初の部品へ寄っていく
+  bannerT = board.focus ? 1.6 : 0;
+}
+
+function newGame() {
+  practiceLog = null;
+  held = false;
+  loadBoard('practice');
+  state = 'play';
+}
+
+function startInter(skipped) {
+  if (skipped) practiceLog = 'skipped';
+  else {
+    practiceLog = jointsLog();
+    canSkip = true;
+    try { localStorage.setItem('handa_practiced', '1'); } catch (e) {}
+  }
+  // 特殊本番は、練習を飛ばしたときだけ25%で出る
+  nextKey = skipped && Math.random() < 0.25 ? 'special' : 'normal';
+  setSizzle(0);
+  state = 'inter'; interT = 0; swapped = false; held = false;
+}
+
+// ---------- 開発用ログ ----------
+// server.js 経由（ポート8123）で開いたときだけ、1プレイごとに logs/plays.jsonl へ記録する
+let gameStartAt = 0, lastReleaseAt = 0, pendingWait = null, pointerKind = '', practiceLog = null;
+const r3 = v => Math.round(v * 1000) / 1000;
+function startHold() {
+  sub = 'hold'; holdT = 0;
+  joints[idx].wait = pendingWait;     // 前の場所を離してから押すまでの秒数
+}
+function jointsLog() {
+  return joints.map((j, i) => ({
+    n: i + 1, part: board.parts[PADS[i].part].name, pin: PADS[i].pin,
+    rate: r3(j.rate), pre: r3(j.pre), wait: j.wait == null ? null : r3(j.wait),
+    hold: r3(j.hold || 0), a: r3(j.a), own: j.own, kind: j.kind, score: j.score
+  }));
+}
+function sendLog() {
+  if (location.port !== '8123') return;   // 開発用サーバー（server.js）のときだけ。公開版では送らない
+  const data = {
+    time: new Date().toISOString(), board: board.key, total, rank,
+    duration: r3((performance.now() - gameStartAt) / 1000),   // 本番だけの秒数
+    device: /iPhone|iPad|iPod/.test(navigator.userAgent) ? 'iOS'
+      : /Android/.test(navigator.userAgent) ? 'Android' : 'PC',
+    pointer: pointerKind, screen: { w: vw, h: vh, dpr: window.devicePixelRatio || 1 },
+    led: ledState, parts: board.parts.map((p, i) => ({ name: p.name, status: partStatus[i] })),
+    joints: jointsLog(),
+    practice: practiceLog              // 'skipped' か、練習の各場所の記録
+  };
+  try {
+    fetch('/log', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data), keepalive: true }).catch(() => {});
+  } catch (e) {}
+}
+
+function finishJoint() {
+  const j = joints[idx], p = PADS[idx];
+  const [kind, score] = classify(j.a, p.br);
+  j.kind = kind; j.score = score;
+  j.own = kind;                       // 巻き添えで書き換わる前の、自分の判定
+  j.rs = solderR(j.a, p.R); j.rt = settledR(j.a, p.R, kind);   // 今の半径 → 落ち着く先の半径
+  j.hold = holdT; lastReleaseAt = performance.now();
+  popups.push({ x: p.x, y: p.y, up: p.R + 14, text: KIND[kind].label, color: KIND[kind].color, t: 0 });
+  // 巻き添え：ブリッジが届いた隣の足は、出来がよくてもブリッジ扱い
+  joints.forEach((s, i) => {
+    if (s.a < PADS[i].br) return;
+    const n = PADS[i].nb, t = joints[n], q = PADS[n];
+    if (!t.kind || t.kind === 'bridge' || t.kind === 'burn') return;
+    t.kind = 'bridge'; t.score = Math.min(t.score, 15);
+    // 同時に出る自分の判定（完璧など）と重ならないよう、一段上に出す
+    popups.push({ x: q.x, y: q.y, up: q.R + 14 + 36, text: '巻き添え', color: KIND.bridge.color, t: 0 });
+  });
+  if (kind === 'good' || kind === 'perfect') { sfxGood(kind === 'perfect'); buzz(kind === 'perfect' ? 18 : 10); }
+  else if (kind === 'burn') { sfxBurn(); buzz(250); }
+  else { sfxBad(); buzz(kind === 'bridge' ? [40, 40, 40] : 35); }
+  setSizzle(0);
+  sub = 'after'; afterT = kind === 'burn' ? 0.5 : 0.25;
+}
+
+function makeResult() {
+  total = Math.round(joints.reduce((s, j) => s + j.score, 0) / N);
+  const c = k => joints.filter(j => j.kind === k).length;
+
+  // 部品ごとの診断：ブリッジ・焦げ → ショート、はんだが足りない → 接触不良
+  diag = [];
+  partStatus = board.parts.map(part => {
+    const short = [], open = [];
+    part.pads.forEach(p => {
+      const k = joints[PADS.indexOf(p)].kind;
+      if (k === 'bridge' || k === 'burn') short.push(p.pin);
+      else if (k === 'none' || k === 'less' || k === 'imo') open.push(p.pin);
+    });
+    const st = short.length ? 'short' : open.length ? 'open' : 'ok';
+    if (st !== 'ok') {
+      const pins = st === 'short' ? short : open;
+      diag.push(part.name + '：' + (st === 'short' ? 'ショート' : '接触不良') +
+        (part.t === 'IC' ? '（' + pins.join('・') + '番ピン）' : ''));
+    }
+    return st;
+  });
+  // ショート、または1か所でも未はんだ（つながっていない）なら光らない。はんだが甘いだけなら点滅
+  // 電源コネクタが悪いと、そもそも電気が来ない
+  const dcBad = board.parts.some((p, i) => p.t === 'D' && partStatus[i] !== 'ok');
+  ledState = partStatus.includes('short') || c('none') > 0 || dcBad ? 'off' : partStatus.includes('open') ? 'flicker' : 'on';
+
+  if (c('none') === N) { rank = '見学者'; comment = 'こてが温まる前に帰りました。'; }
+  else if (c('burn') >= N * 0.4) { rank = '放火魔'; comment = '火災報知器が鳴りました。'; }
+  else if (c('bridge') + c('burn') >= N * 0.66) { rank = '一筆書き'; comment = '全部つながりました。回路とは。'; }
+  else if (total >= 100) { rank = '神の手'; comment = '機械より正確。もう機械では？'; }
+  else if (total >= 90) { rank = 'ベテラン職人'; comment = 'このまま出荷できます。'; }
+  else if (total >= 75) { rank = '一人前'; comment = 'ちゃんと動きます。たぶん。'; }
+  else if (total >= 55) { rank = '見習い'; comment = '動く…かもしれない。'; }
+  else if (total >= 35) { rank = '不器用'; comment = '通電はおすすめしません。'; }
+  else if (total >= 15) { rank = '破壊神'; comment = '基板が泣いています。'; }
+  else { rank = '燃えないゴミ'; comment = '基板だったものです。'; }
+  resultT = 0; powered = false; state = 'result';
+  sendLog();
+}
+
+// ---------- 音 ----------
+let ac = null, sizzleGain = null, noiseBuf = null;
+function initAudio() {
+  if (ac) { if (ac.state === 'suspended') ac.resume(); return; }
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return;
+  try {
+    ac = new AC();
+    noiseBuf = ac.createBuffer(1, ac.sampleRate * 2, ac.sampleRate);
+    const d = noiseBuf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    const src = ac.createBufferSource(); src.buffer = noiseBuf; src.loop = true;
+    const bp = ac.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 4200; bp.Q.value = 0.7;
+    sizzleGain = ac.createGain(); sizzleGain.gain.value = 0;
+    src.connect(bp); bp.connect(sizzleGain); sizzleGain.connect(ac.destination);
+    src.start();
+  } catch (e) { ac = null; }
+}
+function setSizzle(v) {
+  if (!ac || !sizzleGain) return;
+  sizzleGain.gain.setTargetAtTime(v, ac.currentTime, 0.04);
+}
+function tone(freq, dur, type, vol, delay) {
+  if (!ac) return;
+  const t0 = ac.currentTime + (delay || 0);
+  const o = ac.createOscillator(), gn = ac.createGain();
+  o.type = type; o.frequency.value = freq;
+  gn.gain.setValueAtTime(vol, t0);
+  gn.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+  o.connect(gn); gn.connect(ac.destination);
+  o.start(t0); o.stop(t0 + dur + 0.02);
+}
+function sfxGood(perfect) {
+  tone(880, 0.18, 'sine', 0.18);
+  tone(1320, 0.3, 'sine', 0.18, 0.08);
+  if (perfect) tone(1760, 0.4, 'sine', 0.16, 0.16);
+}
+function sfxBad() { tone(150, 0.25, 'sawtooth', 0.12); tone(110, 0.3, 'sawtooth', 0.1, 0.1); }
+function sfxBurn() {
+  if (!ac) return;
+  const src = ac.createBufferSource(); src.buffer = noiseBuf;
+  const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 900;
+  const gn = ac.createGain();
+  gn.gain.setValueAtTime(0.5, ac.currentTime);
+  gn.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + 0.8);
+  src.connect(lp); lp.connect(gn); gn.connect(ac.destination);
+  src.start(); src.stop(ac.currentTime + 0.85);
+}
+function sfxPower() {
+  tone(220, 0.12, 'square', 0.08);    // スイッチ
+  buzz(ledState === 'on' ? [20, 50, 20, 50, 60] : ledState === 'flicker' ? [15, 80, 15] : 300);
+  if (ledState === 'on') { tone(660, 0.2, 'sine', 0.16, 0.15); tone(990, 0.25, 'sine', 0.16, 0.25); tone(1320, 0.5, 'sine', 0.16, 0.35); }
+  else if (ledState === 'flicker') { tone(330, 0.1, 'triangle', 0.14, 0.15); tone(300, 0.1, 'triangle', 0.14, 0.35); }
+  else { if (partStatus.includes('short')) sfxBurn(); tone(90, 0.5, 'sawtooth', 0.14, 0.1); }
+}
+
+// ---------- 入力 ----------
+const skipVisible = () => state === 'play' && isPractice() && canSkip && sub !== 'hold';
+function press(sx, sy) {
+  initAudio();
+  if (state === 'title') { newGame(); return; }
+  if (state === 'play') {
+    if (skipVisible() && sx !== null && sx >= SKIP.x && sx <= SKIP.x + SKIP.w && sy >= SKIP.y && sy <= SKIP.y + SKIP.h) {
+      startInter(true); return;
+    }
+    held = true;                      // 待ち時間中に押しても、次の場所でそのまま始まる
+    pendingWait = lastReleaseAt ? (performance.now() - lastReleaseAt) / 1000 : null;
+    if (sub === 'ready') startHold();
+    return;
+  }
+}
+
+// 結果画面のボタン。誤タップでやり直しにならないよう、ボタンの上を押して離したときだけ反応する
+const BTN_RETRY = { x: 60, y: 712, w: 230, h: 54 }, BTN_SHARE = { x: 310, y: 712, w: 230, h: 54 };
+const inBtn = (b, x, y) => x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h;
+const ledWord = () => (ledState === 'on' ? 'LEDが光った！' : ledState === 'flicker' ? 'LEDがチカチカしてる…' : 'LEDは光らなかった…');
+function shareToX() {
+  const body = '「はんだ付けチャレンジ」で' + total + '点！\n称号：' + rank + '\n' + ledWord() + '\n#はんだ付けチャレンジ';
+  let u = 'https://x.com/intent/post?text=' + encodeURIComponent(body);
+  // 公開後は、このページのURLを投稿に付ける（手元のファイルや開発用サーバーのときは付けない）
+  if (location.protocol === 'https:') u += '&url=' + encodeURIComponent(location.origin + location.pathname);
+  window.open(u, '_blank', 'noopener');
+}
+function clickResult(sx, sy) {
+  if (state !== 'result' || resultT < T_PANEL + 0.9) return;
+  if (inBtn(BTN_RETRY, sx, sy)) newGame();
+  else if (inBtn(BTN_SHARE, sx, sy)) shareToX();
+}
+function release() {
+  held = false;
+  if (state === 'play' && sub === 'hold') finishJoint();
+}
+cv.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  pointerKind = e.pointerType || '';
+  press((e.clientX - ox) / scale, (e.clientY - oy) / scale);
+});
+cv.addEventListener('click', e => clickResult((e.clientX - ox) / scale, (e.clientY - oy) / scale));
+window.addEventListener('pointerup', release);
+window.addEventListener('pointercancel', release);
+window.addEventListener('blur', release);
+cv.addEventListener('contextmenu', e => e.preventDefault());
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space' || e.code === 'Enter') { e.preventDefault(); if (!e.repeat) press(null, null); }
+  if (e.code === 'KeyS' && skipVisible()) startInter(true);
+});
+window.addEventListener('keyup', e => {
+  if (e.code === 'Space' || e.code === 'Enter') release();
+});
+
+// ---------- 更新 ----------
+function puff(x, y, dark, spread) {
+  smoke.push({
+    x: x + (Math.random() - 0.5) * spread, y,
+    vx: (Math.random() - 0.5) * 20, vy: -50 - Math.random() * 40,
+    r: 6 + Math.random() * 6, t: 0, max: 1.1 + Math.random() * 0.7, dark
+  });
+}
+
+function update(dt) {
+  time += dt;
+  if (bannerT > 0) bannerT -= dt;
+  if (state === 'play') {
+    const j = joints[idx], p = PADS[idx];
+    if (sub === 'hold') {
+      holdT += dt;
+      if (holdT > j.pre) {
+        // 盛るほど速くなる（指数関数的）。base が出だしの速さ、acc が加速の強さ
+        const T = board.parts[p.part].T;
+        j.a += SPEED * j.rate * ((T.base || 0.4) + (T.acc || 1) * j.a) * dt;
+        setSizzle(0.05 + Math.min(j.a, 2) * 0.05);
+        if (Math.random() < dt * (j.a > 1.6 ? 40 : 14)) puff(p.x, p.y - 6, j.a > 2.1, 20);
+        if (j.a >= A_MAX) { held = false; finishJoint(); }  // 押しっぱなしで次まで焦がさない
+      }
+    } else if (sub === 'after') {
+      afterT -= dt;
+      if (afterT <= 0) {
+        if (idx + 1 >= N) {
+          if (isPractice()) startInter(false); else makeResult();
+        } else {
+          const before = PADS[idx].part;
+          idx++;
+          if (PADS[idx].part !== before) bannerT = 1.6;   // 次の部品へ
+          if (held) startHold(); else sub = 'ready';
+        }
+      }
+    }
+  } else if (state === 'inter') {
+    // 練習の基板が左へ出ていき、本番の基板が右から入ってくる
+    interT += dt;
+    if (!swapped && interT >= 0.9) { loadBoard(nextKey); swapped = true; }
+    if (interT >= 1.8) { state = 'play'; held = false; gameStartAt = performance.now(); }
+  } else if (state === 'result') {
+    resultT += dt;
+    if (!powered && resultT >= T_POWER) { powered = true; sfxPower(); }
+    if (powered) {
+      // ショートした部品から煙
+      board.parts.forEach((part, i) => {
+        if (partStatus[i] === 'short' && Math.random() < dt * 9) puff(part.x, part.y, true, 50);
+      });
+    }
+  }
+
+  // カメラ：作業中は部品に寄り、それ以外は基板全体
+  const tc = state === 'play' && board.focus ? focusCam(curPart()) : overviewCam();
+  const kc = 1 - Math.exp(-dt * 7);
+  cam.x += (tc.x - cam.x) * kc; cam.y += (tc.y - cam.y) * kc; cam.z += (tc.z - cam.z) * kc;
+
+  // こてとはんだ線の位置（画面上の座標）
+  let ix = 560, iy = 760, wx = 60, wy = 40;
+  if (state === 'play') {
+    const p = PADS[idx], [px, py] = w2s(p.x, p.y), rz = p.R * cam.z;
+    if (sub === 'hold') {
+      ix = px + rz * 0.47; iy = py + rz * 0.41;
+      if (holdT > joints[idx].pre) { wx = px - rz * 0.35; wy = py - rz * 0.35; } else { wx = px - 60; wy = py - 80; }
+    } else {
+      ix = px + rz + 46 + Math.sin(time * 2) * 3; iy = py + rz + 70 + Math.cos(time * 2.3) * 3;
+      wx = px - 70; wy = py - 95;
+    }
+  }
+  const k = 1 - Math.exp(-dt * 22);
+  iron.x += (ix - iron.x) * k; iron.y += (iy - iron.y) * k;
+  wire.x += (wx - wire.x) * k; wire.y += (wy - wire.y) * k;
+
+  for (const s of smoke) {
+    s.t += dt; s.x += s.vx * dt; s.y += s.vy * dt; s.r += 14 * dt;
+    s.vx += Math.sin(time * 3 + s.y * 0.05) * 30 * dt;
+  }
+  smoke = smoke.filter(s => s.t < s.max);
+  const ks = 1 - Math.exp(-dt * 16);
+  for (const j of joints) if (j.own) j.rs += (j.rt - j.rs) * ks;
+  for (const q of popups) q.t += dt;
+  popups = popups.filter(q => q.t < 1.1);
+}
+
+// ---------- 描画：共通 ----------
+function rr(x, y, w, h, r) {
+  g.beginPath();
+  g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath();
+}
+function text(s, x, y, size, color, align, weight) {
+  g.font = (weight || 'bold') + ' ' + size + 'px ' + FONT;
+  g.textAlign = align || 'center'; g.textBaseline = 'middle';
+  g.lineJoin = 'round'; g.lineWidth = Math.max(3, size * 0.16);
+  g.strokeStyle = 'rgba(0,0,0,0.65)'; g.strokeText(s, x, y);
+  g.fillStyle = color; g.fillText(s, x, y);
+}
+function circle(x, y, r) { g.beginPath(); g.arc(x, y, r, 0, 7); }
+
+function drawBench() {
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const bg = g.createLinearGradient(0, 0, 0, vh);
+  bg.addColorStop(0, '#2a2c31'); bg.addColorStop(1, '#141518');
+  g.fillStyle = bg; g.fillRect(0, 0, vw, vh);
+  g.setTransform(dpr * scale, 0, 0, dpr * scale, ox * dpr, oy * dpr);
+}
+
+// ---------- 描画：基板（はんだ面） ----------
+function drawBase() {
+  const b = board.rect, col = board.col;
+  g.save();
+  g.shadowColor = 'rgba(0,0,0,0.6)'; g.shadowBlur = 24; g.shadowOffsetY = 10;
+  rr(b.x, b.y, b.w, b.h, 14);
+  const gr = g.createLinearGradient(b.x, b.y, b.x + b.w, b.y + b.h);
+  gr.addColorStop(0, col.a); gr.addColorStop(0.5, col.b); gr.addColorStop(1, col.c);
+  g.fillStyle = gr; g.fill();
+  g.restore();
+}
+function drawHolesAndGloss() {
+  const b = board.rect;
+  for (const [hx, hy] of [[b.x + 32, b.y + 32], [b.x + b.w - 32, b.y + 32], [b.x + 32, b.y + b.h - 32], [b.x + b.w - 32, b.y + b.h - 32]]) {
+    circle(hx, hy, 15); g.fillStyle = '#c9a24e'; g.fill();
+    circle(hx, hy, 9); g.fillStyle = '#17181b'; g.fill();
+  }
+  const sh = g.createLinearGradient(b.x, b.y, b.x + b.w * 0.7, b.y + b.h);
+  sh.addColorStop(0, 'rgba(255,255,255,0.10)'); sh.addColorStop(0.35, 'rgba(255,255,255,0)');
+  g.fillStyle = sh; g.fillRect(b.x, b.y, b.w, b.h);
+}
+function drawTraces(traces, tw) {
+  g.lineCap = 'round'; g.lineJoin = 'round';
+  for (const pass of [0, 1]) {
+    g.strokeStyle = pass ? board.col.trL : board.col.trD;
+    g.lineWidth = pass ? tw : tw + 4;
+    for (const t of traces) {
+      g.beginPath(); g.moveTo(t[0][0], t[0][1]);
+      for (let k = 1; k < t.length; k++) g.lineTo(t[k][0], t[k][1]);
+      g.stroke();
+    }
+  }
+}
+function silkStyle(size, align) {
+  g.strokeStyle = SILK; g.fillStyle = SILK; g.lineWidth = 2;
+  g.font = 'bold ' + size + 'px monospace'; g.textAlign = align || 'left'; g.textBaseline = 'middle';
+}
+
+// 裏面にも「ここにこの部品」とわかる表記を入れる
+function silkPart(part) {
+  const P = part.pads, x = part.x, y = part.y;
+  silkStyle(15);
+  if (part.t === 'R') {
+    rr(x - 30, y - 14, 60, 28, 5); g.stroke();
+    g.beginPath(); g.moveTo(P[0].x + P[0].R + 5, y); g.lineTo(x - 30, y);
+    g.moveTo(x + 30, y); g.lineTo(P[1].x - P[1].R - 5, y); g.stroke();
+    g.textAlign = 'center'; g.fillText(part.name, x, y - 30);
+  } else if (part.t === 'C') {
+    circle(x, y, 74); g.stroke();
+    g.beginPath(); g.moveTo(x - 50, y - 48); g.lineTo(x - 36, y - 48); g.moveTo(x - 43, y - 55); g.lineTo(x - 43, y - 41); g.stroke();
+    g.fillText(part.name, x + 58, y - 62);
+  } else if (part.t === 'L') {
+    g.beginPath(); g.arc(x, y, 66, 0.55, Math.PI * 2 - 0.55); g.closePath(); g.stroke();
+    g.fillText(part.name, x - 66, y - 72);
+  } else if (part.t === 'D') {
+    rr(x - 71, y - 36, 142, 72, 6); g.stroke();
+    g.fillText(part.name, x - 71, y - 48);
+  } else if (part.t === 'IC') {
+    const x0 = P[0].x - 34, y0 = P[0].y - 34, w = P[3].x + 34 - x0, h = P[4].y + 34 - y0;
+    rr(x0, y0, w, h, 6); g.stroke();
+    g.beginPath(); g.arc(x0, y, 12, -Math.PI / 2, Math.PI / 2); g.stroke();
+    circle(x0 + 16, y - 22, 4); g.fill();
+    g.fillText(part.name, x0 + 34, y);
+    g.font = 'bold 12px monospace'; g.textAlign = 'center';
+    P.forEach(p => g.fillText(String(p.pin), p.x, p.y + (p.pin <= 4 ? 30 : -30)));
+  }
+}
+
+function drawBack() {
+  const b = board.rect;
+  g.save();
+  rr(b.x, b.y, b.w, b.h, 14); g.clip();
+  if (isPractice()) {
+    const traces = [];
+    PADS.forEach((p, i) => {
+      const dir = i < 3 ? -1 : 1, bend = (i % 3 - 1) * 46;
+      traces.push([[p.x, p.y], [p.x, p.y + dir * 62], [p.x + bend, p.y + dir * 104], [p.x + bend, p.y + dir * 150]]);
+    });
+    traces.push([[60, 300], [112, 300], [112, 350], [60, 350]]);
+    traces.push([[540, 285], [492, 285], [492, 365], [540, 365]]);
+    drawTraces(traces, 10);
+    silkStyle(13);
+    rr(118, 196, 364, 264, 6); g.stroke();
+    g.beginPath(); g.arc(300, 196, 12, 0, Math.PI); g.stroke();
+    g.fillText('CN1', 122, 184);
+    g.textAlign = 'center';
+    PADS.forEach((p, i) => g.fillText(String(i + 1), p.x - p.R - 8, p.y - p.R + 2));
+  } else {
+    drawTraces(board.traces, 9);
+    board.parts.forEach(silkPart);
+  }
+  silkStyle(13);
+  g.fillText(board.rev, b.x + 70, b.y + b.h - 18);
+  drawHolesAndGloss();
+  g.restore();
+}
+
+function drawPad(p, heat) {
+  const R = p.R, u = R / 34;
+  circle(p.x, p.y, R + 4 * u); g.fillStyle = board.col.resist; g.fill();   // レジスト抜き
+  const gr = g.createRadialGradient(p.x - 10 * u, p.y - 12 * u, 2, p.x, p.y, R);
+  gr.addColorStop(0, '#f6d58a'); gr.addColorStop(0.6, '#cf9a45'); gr.addColorStop(1, '#9a6a26');
+  circle(p.x, p.y, R); g.fillStyle = gr; g.fill();                          // 銅箔
+  if (heat > 0) { circle(p.x, p.y, R); g.fillStyle = 'rgba(255,90,20,' + (0.35 * heat) + ')'; g.fill(); }
+  circle(p.x, p.y, 11 * u); g.fillStyle = '#1a1206'; g.fill();              // 穴
+  drawLead(p.x, p.y, 8 * u);                                                 // 足
+}
+function drawLead(x, y, r) {
+  const gr = g.createRadialGradient(x - r * 0.4, y - r * 0.4, 0.5, x, y, r);
+  gr.addColorStop(0, '#ffffff'); gr.addColorStop(0.5, '#b9c0c8'); gr.addColorStop(1, '#5a6068');
+  circle(x, y, r); g.fillStyle = gr; g.fill();
+}
+
+function blobPath(x, y, r, seed, k) {
+  const n = 9, pts = [];
+  for (let i = 0; i < n; i++) {
+    const ang = i / n * Math.PI * 2, q = r * (1 + k * (seed[i] - 0.5) * 2);
+    pts.push([x + Math.cos(ang) * q, y + Math.sin(ang) * q]);
+  }
+  g.beginPath();
+  g.moveTo((pts[n - 1][0] + pts[0][0]) / 2, (pts[n - 1][1] + pts[0][1]) / 2);
+  for (let i = 0; i < n; i++) {
+    const a = pts[i], b = pts[(i + 1) % n];
+    g.quadraticCurveTo(a[0], a[1], (a[0] + b[0]) / 2, (a[1] + b[1]) / 2);
+  }
+  g.closePath();
+}
+
+function solderGrad(x, y, r, tone) {
+  const gr = g.createRadialGradient(x - r * 0.38, y - r * 0.4, r * 0.04, x, y, r * 1.08);
+  if (tone === 'dull') {
+    gr.addColorStop(0, '#a3a6a9'); gr.addColorStop(0.6, '#85888b'); gr.addColorStop(1, '#5b5e61');
+  } else if (tone === 'burnt') {
+    gr.addColorStop(0, '#c9c4bb'); gr.addColorStop(0.3, '#7d776e'); gr.addColorStop(1, '#2b2723');
+  } else {
+    gr.addColorStop(0, '#ffffff'); gr.addColorStop(0.22, '#e3e8ee');
+    gr.addColorStop(0.65, '#a6aeb7'); gr.addColorStop(1, '#727a83');
+  }
+  return gr;
+}
+
+function drawScorch(j, p) {
+  const a = j.a, R = p.R;
+  if (a < 1.9) return;
+  const s = Math.min(1, (a - 1.9) / 0.5), rad = R * (1.6 + s * 1.3);
+  const gr = g.createRadialGradient(p.x, p.y, R * 0.6, p.x, p.y, rad);
+  gr.addColorStop(0, 'rgba(15,8,2,' + (0.95 * s) + ')');
+  gr.addColorStop(0.6, 'rgba(40,20,5,' + (0.7 * s) + ')');
+  gr.addColorStop(1, 'rgba(40,20,5,0)');
+  g.fillStyle = gr; circle(p.x, p.y, rad); g.fill();
+}
+
+function drawSolder(j, i, molten) {
+  const a = j.a, p = PADS[i], R = p.R;
+  if (a < 0.03) return;
+  const kind = j.own || classify(a, p.br)[0];
+  const r = j.own ? j.rs : solderR(a, R);
+  const dull = !molten && kind === 'imo';
+  const burnt = kind === 'burn';
+  const tone = dull ? 'dull' : burnt ? 'burnt' : 'shiny';
+  const irr = dull ? 0.13 : a > 1.18 ? Math.min(0.2, 0.02 + (a - 1.18) * 0.22) : 0.012;
+
+  g.save();
+  g.shadowColor = 'rgba(0,0,0,0.5)'; g.shadowBlur = 7; g.shadowOffsetY = 3;
+
+  // 盛りすぎの間は隣へ向かって伸び、br（ブリッジ判定）でちょうど届く
+  if (a >= 1.25) {
+    const q = PADS[p.nb];
+    const s = a >= p.br ? 1 : (a - 1.25) / (p.br - 1.25) * 0.7;
+    const ex = p.x + (q.x - p.x) * s, ey = p.y + (q.y - p.y) * s;
+    g.lineCap = 'round'; g.lineWidth = R * (0.75 + 0.2 * s);
+    const lg = g.createLinearGradient(p.x, p.y - R * 0.5, p.x, p.y + R * 0.5);
+    if (burnt) { lg.addColorStop(0, '#a39d93'); lg.addColorStop(1, '#2b2723'); }
+    else { lg.addColorStop(0, '#f2f5f8'); lg.addColorStop(0.5, '#a4acb5'); lg.addColorStop(1, '#565d65'); }
+    g.strokeStyle = lg;
+    g.beginPath(); g.moveTo(p.x, p.y); g.lineTo(ex, ey); g.stroke();
+    if (s >= 1) { g.fillStyle = solderGrad(q.x, q.y, R * 0.7, tone); circle(q.x, q.y, R * 0.7); g.fill(); }
+  }
+
+  blobPath(p.x, p.y, r, j.seed, irr);
+  g.fillStyle = solderGrad(p.x, p.y, r, tone); g.fill();
+  g.restore();
+  // 縁をくっきりさせて、どこまで埋まったか見たとおりにする
+  blobPath(p.x, p.y, r, j.seed, irr);
+  g.strokeStyle = 'rgba(30,34,38,0.55)'; g.lineWidth = 1; g.stroke();
+
+  if (molten) {
+    blobPath(p.x, p.y, r, j.seed, irr);
+    g.fillStyle = 'rgba(255,150,60,' + (0.12 + 0.05 * Math.sin(time * 30)) + ')'; g.fill();
+  }
+  if (dull) {
+    // ざらつきとひび
+    g.fillStyle = 'rgba(40,42,44,0.45)';
+    for (let k = 0; k < 9; k++) {
+      const ang = j.seed[k] * 6.283 + k, d = r * 0.75 * j.seed[(k + 3) % 9];
+      circle(p.x + Math.cos(ang) * d, p.y + Math.sin(ang) * d, 1.6); g.fill();
+    }
+    g.strokeStyle = 'rgba(30,30,32,0.6)'; g.lineWidth = 1.5;
+    g.beginPath(); g.moveTo(p.x - r * 0.5, p.y - r * 0.1); g.lineTo(p.x - r * 0.1, p.y + r * 0.15);
+    g.lineTo(p.x + r * 0.2, p.y - r * 0.05); g.lineTo(p.x + r * 0.55, p.y + r * 0.3); g.stroke();
+  }
+  if (a < 1.3) {
+    // 富士山型のすそ野と、頂上から出る足
+    g.strokeStyle = 'rgba(255,255,255,' + (dull ? 0.08 : 0.28) + ')'; g.lineWidth = 2;
+    g.beginPath(); g.arc(p.x, p.y, r * 0.55, Math.PI * 0.9, Math.PI * 1.7); g.stroke();
+    if (a > 0.3) drawLead(p.x, p.y, 6 * R / 34);
+  }
+}
+
+// ---------- 描画：基板（部品面）。全体が左右反転した状態で呼ばれる ----------
+// 反転中でも文字が読めるように、その場で左右を戻して描く
+function ftext(s, x, y, size, color, font) {
+  g.save(); g.translate(x, y); g.scale(-1, 1);
+  g.font = 'bold ' + size + 'px ' + (font || 'monospace'); g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillStyle = color; g.fillText(s, 0, 0);
+  g.restore();
+}
+function frontPad(p) {
+  circle(p.x, p.y, p.R * 0.62); g.fillStyle = '#b98a3c'; g.fill();
+  circle(p.x, p.y, p.R * 0.3); g.fillStyle = '#d7dce2'; g.fill();
+}
+function shadowOn() { g.shadowColor = 'rgba(0,0,0,0.55)'; g.shadowBlur = 10; g.shadowOffsetY = 6; }
+function shadowOff() { g.shadowColor = 'transparent'; g.shadowBlur = 0; g.shadowOffsetY = 0; }
+
+function ledLevel() {
+  if (!powered || ledState === 'off') return 0;
+  if (ledState === 'on') return 1;
+  return Math.sin(time * 23) + Math.sin(time * 37.7) > 0.2 ? 1 : 0.08;   // 接触不良でチカチカ
+}
+
+function drawFrontPart(part, st) {
+  const P = part.pads, x = part.x, y = part.y;
+  P.forEach(frontPad);
+  g.save();
+  if (part.t === 'R') {
+    g.strokeStyle = '#c3c9d0'; g.lineWidth = 5; g.lineCap = 'round';
+    g.beginPath(); g.moveTo(P[0].x, y); g.lineTo(P[1].x, y); g.stroke();
+    shadowOn();
+    const gr = g.createLinearGradient(0, y - 15, 0, y + 15);
+    gr.addColorStop(0, '#f0dcb4'); gr.addColorStop(0.5, '#d9bd8a'); gr.addColorStop(1, '#a98c5c');
+    rr(x - 38, y - 15, 76, 30, 12); g.fillStyle = gr; g.fill();
+    shadowOff();
+    ['#7a4a1f', '#1b1b1b', '#c0392b', '#c9a227'].forEach((c, i) => {
+      g.fillStyle = c; g.fillRect(x - 26 + i * 15 + (i === 3 ? 6 : 0), y - 15, 7, 30);
+    });
+  } else if (part.t === 'C') {
+    shadowOn();
+    circle(x, y, 68); g.fillStyle = '#1b2545'; g.fill();
+    shadowOff();
+    g.beginPath(); g.moveTo(x, y); g.arc(x, y, 68, -0.5, 0.5); g.closePath(); g.fillStyle = '#c9ced6'; g.fill();   // マイナス側の帯
+    const gr = g.createRadialGradient(x - 18, y - 20, 4, x, y, 56);
+    gr.addColorStop(0, '#f4f6f8'); gr.addColorStop(0.6, '#b4bac2'); gr.addColorStop(1, '#7c838c');
+    circle(x, y, 56); g.fillStyle = gr; g.fill();
+    g.strokeStyle = 'rgba(60,66,74,0.7)'; g.lineWidth = 2.5;   // 防爆弁
+    g.beginPath();
+    for (const a of [-Math.PI / 2, Math.PI / 6, Math.PI * 5 / 6]) { g.moveTo(x, y); g.lineTo(x + Math.cos(a) * 34, y + Math.sin(a) * 34); }
+    g.stroke();
+  } else if (part.t === 'L') {
+    const lv = ledLevel();
+    shadowOn();
+    g.beginPath(); g.arc(x, y, 60, 0.55, Math.PI * 2 - 0.55); g.closePath(); g.fillStyle = '#8f1515'; g.fill();
+    shadowOff();
+    const gr = g.createRadialGradient(x - 14, y - 16, 3, x, y, 50);
+    if (lv > 0.5) { gr.addColorStop(0, '#ffffff'); gr.addColorStop(0.35, '#ffd0d0'); gr.addColorStop(1, '#ff3030'); }
+    else { gr.addColorStop(0, '#ffb3b3'); gr.addColorStop(0.3, '#d23a3a'); gr.addColorStop(1, '#6e0f0f'); }
+    circle(x, y, 50); g.fillStyle = gr; g.fill();
+  } else if (part.t === 'D') {
+    shadowOn();
+    rr(x - 69, y - 40, 138, 80, 6); g.fillStyle = '#202226'; g.fill();
+    shadowOff();
+    P.forEach(p => { circle(p.x, p.y, 13); g.fillStyle = '#0c0d0f'; g.fill(); drawLead(p.x, p.y, 7); });
+  } else if (part.t === 'IC') {
+    // 足
+    P.forEach(p => {
+      const top = p.pin <= 4, gr = g.createLinearGradient(p.x - 8, 0, p.x + 8, 0);
+      gr.addColorStop(0, '#8d949c'); gr.addColorStop(0.5, '#eef1f4'); gr.addColorStop(1, '#8d949c');
+      g.fillStyle = gr; g.fillRect(p.x - 8, top ? p.y - 6 : y + 30, 16, 36);
+    });
+    shadowOn();
+    const x0 = P[0].x - 26, w = P[3].x + 26 - x0;
+    const gr = g.createLinearGradient(0, y - 40, 0, y + 40);
+    gr.addColorStop(0, '#34363c'); gr.addColorStop(1, '#17181b');
+    rr(x0, y - 40, w, 80, 5); g.fillStyle = gr; g.fill();
+    shadowOff();
+    g.beginPath(); g.arc(x0, y, 11, -Math.PI / 2, Math.PI / 2); g.fillStyle = '#0c0d0f'; g.fill();
+    circle(x0 + 20, y - 24, 5); g.fillStyle = '#0c0d0f'; g.fill();
+    ftext('HD74HC00', x + 6, y - 6, 20, '#aab0b8');
+    ftext('JAPAN 2B4', x + 6, y + 16, 13, '#7d838b');
+  }
+  g.restore();
+
+  ftext(part.name, x, y - { R: 30, C: 84, L: 76, IC: 92, D: 54 }[part.t], 15, SILK);
+
+  // 通電後：壊れた部品に印をつける
+  if (powered && st !== 'ok') {
+    if (st === 'short') {
+      const rad = part.t === 'IC' ? 130 : 80;
+      const gr = g.createRadialGradient(x, y, 10, x, y, rad);
+      gr.addColorStop(0, 'rgba(20,10,4,0.75)'); gr.addColorStop(1, 'rgba(20,10,4,0)');
+      circle(x, y, rad); g.fillStyle = gr; g.fill();
+    }
+    const pulse = 1 + 0.08 * Math.sin(time * 8);
+    g.save(); g.translate(x, y); g.scale(-pulse, pulse);
+    g.font = 'bold 64px ' + FONT; g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.lineWidth = 8; g.lineJoin = 'round'; g.strokeStyle = 'rgba(0,0,0,0.75)';
+    const mark = st === 'short' ? '×' : '？';
+    g.strokeText(mark, 0, 0);
+    g.fillStyle = st === 'short' ? '#ff5a4a' : '#ffd34d'; g.fillText(mark, 0, 0);
+    g.restore();
+  }
+}
+
+function drawFront() {
+  const b = board.rect;
+  g.save();
+  rr(b.x, b.y, b.w, b.h, 14); g.clip();
+  drawHolesAndGloss();
+  g.restore();
+  board.parts.forEach((part, i) => drawFrontPart(part, partStatus[i]));
+
+  // LEDの光
+  const lv = ledLevel();
+  if (lv > 0) {
+    const led = board.parts.find(p => p.t === 'L');
+    g.save(); g.globalCompositeOperation = 'lighter';
+    const gr = g.createRadialGradient(led.x, led.y, 10, led.x, led.y, 260);
+    gr.addColorStop(0, 'rgba(255,90,70,' + (0.75 * lv) + ')'); gr.addColorStop(0.3, 'rgba(255,40,30,' + (0.3 * lv) + ')');
+    gr.addColorStop(1, 'rgba(255,40,30,0)');
+    circle(led.x, led.y, 260); g.fillStyle = gr; g.fill();
+    g.restore();
+  }
+}
+
+// ---------- 描画：道具と演出 ----------
+function drawIron() {
+  g.save();
+  g.translate(iron.x, iron.y); g.rotate(1.1);
+  g.shadowColor = 'rgba(0,0,0,0.5)'; g.shadowBlur = 12; g.shadowOffsetX = -6; g.shadowOffsetY = 8;
+  // グリップ
+  let gr = g.createLinearGradient(0, -24, 0, 24);
+  gr.addColorStop(0, '#3f6fd8'); gr.addColorStop(0.5, '#274a9c'); gr.addColorStop(1, '#16295c');
+  g.fillStyle = gr; rr(268, -24, 520, 48, 14); g.fill();
+  g.fillStyle = '#16181c'; rr(252, -27, 34, 54, 8); g.fill();
+  g.shadowColor = 'transparent';
+  // ヒーター部
+  gr = g.createLinearGradient(0, -9, 0, 9);
+  gr.addColorStop(0, '#f1f3f5'); gr.addColorStop(0.5, '#9aa1a8'); gr.addColorStop(1, '#4d5359');
+  g.fillStyle = gr; g.fillRect(70, -9, 186, 18);
+  g.fillStyle = '#5a6067'; g.fillRect(150, -12, 14, 24); g.fillRect(232, -13, 22, 26);
+  // こて先
+  gr = g.createLinearGradient(0, -8, 0, 8);
+  gr.addColorStop(0, '#e9edf1'); gr.addColorStop(0.5, '#a9b0b7'); gr.addColorStop(1, '#5d636a');
+  g.fillStyle = gr;
+  g.beginPath(); g.moveTo(0, 0); g.lineTo(46, -7); g.lineTo(72, -7); g.lineTo(72, 7); g.lineTo(46, 7); g.closePath(); g.fill();
+  // 熱
+  const hot = g.createLinearGradient(0, 0, 60, 0);
+  hot.addColorStop(0, 'rgba(255,120,30,0.55)'); hot.addColorStop(1, 'rgba(255,120,30,0)');
+  g.fillStyle = hot;
+  g.beginPath(); g.moveTo(0, 0); g.lineTo(46, -7); g.lineTo(60, -7); g.lineTo(60, 7); g.lineTo(46, 7); g.closePath(); g.fill();
+  g.restore();
+}
+
+function drawWire() {
+  const dx = -0.5, dy = -0.866, L = 900;
+  g.save();
+  g.lineCap = 'round';
+  g.shadowColor = 'rgba(0,0,0,0.45)'; g.shadowBlur = 6; g.shadowOffsetX = -3; g.shadowOffsetY = 5;
+  g.strokeStyle = '#8b9198'; g.lineWidth = 6;
+  g.beginPath(); g.moveTo(wire.x, wire.y); g.lineTo(wire.x + dx * L, wire.y + dy * L); g.stroke();
+  g.shadowColor = 'transparent';
+  g.strokeStyle = '#e4e8ec'; g.lineWidth = 2;
+  g.beginPath(); g.moveTo(wire.x - 1, wire.y); g.lineTo(wire.x - 1 + dx * L, wire.y + dy * L); g.stroke();
+  g.restore();
+}
+
+function drawSmoke() {
+  for (const s of smoke) {
+    const al = (1 - s.t / s.max) * (s.dark ? 0.5 : 0.28);
+    g.fillStyle = s.dark ? 'rgba(30,26,22,' + al + ')' : 'rgba(225,230,235,' + al + ')';
+    circle(s.x, s.y, s.r); g.fill();
+  }
+}
+
+// 裏返しの進み具合：1 = はんだ面、-1 = 部品面
+function flipC() {
+  if (state !== 'result' || resultT < T_FLIP0) return 1;
+  if (resultT >= T_FLIP1) return -1;
+  return Math.cos(Math.PI * (resultT - T_FLIP0) / (T_FLIP1 - T_FLIP0));
+}
+
+function drawScene() {
+  const playing = state === 'play';
+  // 基板の入れ替え中は横にスライドさせる
+  let off = 0;
+  if (state === 'inter') {
+    const e = t => t * t * (3 - 2 * t);
+    off = interT < 0.9 ? -e(Math.min(1, Math.max(0, (interT - 0.3) / 0.6))) * 760
+                       : (1 - e(Math.min(1, (interT - 0.9) / 0.6))) * 760;
+  }
+  g.save();
+  rr(VIEW.x, VIEW.y, VIEW.w, VIEW.h, 18); g.clip();
+  g.translate(off + VIEW.cx, VIEW.cy); g.scale(cam.z, cam.z); g.translate(-cam.x, -cam.y);
+  let c = flipC();
+  if (Math.abs(c) < 0.03) c = c < 0 ? -0.03 : 0.03;
+  const bx = board.rect.x + board.rect.w / 2;
+  g.translate(bx, 0); g.scale(c, 1); g.translate(-bx, 0);
+
+  drawBase();
+  if (c > 0) {
+    drawBack();
+    // 焦げ跡 → パッド → はんだ の順
+    joints.forEach((j, i) => drawScorch(j, PADS[i]));
+    PADS.forEach((p, i) => {
+      const heat = playing && sub === 'hold' && i === idx ? Math.min(1, holdT / joints[i].pre) : 0;
+      drawPad(p, heat);
+    });
+    joints.forEach((j, i) => drawSolder(j, i, playing && sub === 'hold' && i === idx));
+    if (playing && sub === 'ready') {
+      const p = PADS[idx], pulse = 0.5 + 0.5 * Math.sin(time * 7);
+      g.strokeStyle = 'rgba(255,240,120,' + (0.5 + 0.5 * pulse) + ')'; g.lineWidth = 4;
+      circle(p.x, p.y, p.R + 9 + pulse * 5); g.stroke();
+    }
+  } else {
+    drawFront();
+  }
+  drawSmoke();
+  g.restore();
+
+  // 練習だけ、判定を出しっぱなしにする（本番は部品が多くてごちゃつくので出さない）
+  if (isPractice() && state !== 'title') {
+    joints.forEach((j, i) => {
+      if (!j.kind) return;
+      const p = PADS[i], [sx, sy] = w2s(p.x, p.y);
+      text(KIND[j.kind].label.replace('！', ''), sx + off, sy + p.R * cam.z + 22, 15, KIND[j.kind].color);
+    });
+  }
+  if (playing) { drawWire(); drawIron(); }
+  for (const q of popups) {
+    const [sx, sy] = w2s(q.x, q.y);
+    g.globalAlpha = Math.max(0, 1 - Math.max(0, q.t - 0.6) / 0.5);
+    const pop = 1 + Math.max(0, 0.15 - q.t) * 3;
+    text(q.text, sx + off, sy - q.up * cam.z - q.t * 34, 30 * pop, q.color);
+    g.globalAlpha = 1;
+  }
+}
+
+// ---------- 描画：文字と画面 ----------
+function drawHud() {
+  text('はんだ付けチャレンジ', W / 2, 44, 28, '#f2f4f6');
+  const colr = isPractice() ? '#ffd34d' : board.key === 'special' ? '#ff9ad5' : '#ff8a7a';
+  text(board.label + '　' + (idx + 1) + ' / ' + N, W / 2, 82, 18, colr);
+  if (board.focus && bannerT > 0) {
+    const part = curPart();
+    g.globalAlpha = Math.min(1, bannerT / 0.4);
+    text(part.name + '（' + part.T.jp + '）', W / 2, 138, 26, '#ffffff');
+    g.globalAlpha = 1;
+  }
+  const msg = sub === 'hold' ? 'ちょうどで離せ！' : '長押しでこてを当てる';
+  text(msg, W / 2, 600, 30, '#ffffff');
+  if (isPractice()) text('パッドがぴったり埋まったら指を離す', W / 2, 648, 18, '#aab2ba', 'center', 'normal');
+  if (skipVisible()) {
+    rr(SKIP.x, SKIP.y, SKIP.w, SKIP.h, SKIP.h / 2);
+    g.fillStyle = 'rgba(255,255,255,0.10)'; g.fill();
+    g.strokeStyle = 'rgba(255,255,255,0.45)'; g.lineWidth = 2; g.stroke();
+    text('練習をスキップ ▶', W / 2, SKIP.y + SKIP.h / 2, 22, '#ffffff');
+  }
+}
+
+function drawInter() {
+  text('はんだ付けチャレンジ', W / 2, 44, 28, '#f2f4f6');
+  const a = Math.min(1, interT / 0.25) * Math.min(1, (1.8 - interT) / 0.25);
+  g.globalAlpha = Math.max(0, a);
+  if (nextKey === 'special') {
+    text('特殊基板だ！', W / 2, 600, 46, '#ff9ad5');
+    text('ICが2個。' + BOARDS.special.pads.length + 'か所。', W / 2, 660, 24, '#e6eaee', 'center', 'normal');
+  } else {
+    text('ここから本番！', W / 2, 600, 46, '#ff8a7a');
+    text(BOARDS.normal.pads.length + 'か所。部品ごとにクセがある。', W / 2, 660, 24, '#e6eaee', 'center', 'normal');
+  }
+  g.globalAlpha = 1;
+}
+
+function drawTitle() {
+  g.fillStyle = 'rgba(10,11,13,0.62)'; g.fillRect(-2000, -2000, 5000, 5000);
+  text('はんだ付け', W / 2, 250, 76, '#ffffff');
+  text('チャレンジ', W / 2, 340, 76, '#ffd34d');
+  text('長押しで、はんだを盛る。', W / 2, 450, 24, '#e6eaee', 'center', 'normal');
+  text('パッドがぴったり埋まったら離す。', W / 2, 488, 24, '#e6eaee', 'center', 'normal');
+  text('それだけ。', W / 2, 526, 24, '#e6eaee', 'center', 'normal');
+  g.globalAlpha = 0.6 + 0.4 * Math.sin(time * 4);
+  text('タップしてスタート', W / 2, 640, 34, '#7dff8f');
+  g.globalAlpha = 1;
+  text('♪ 音が出ます', W / 2, 700, 20, '#aab2ba', 'center', 'normal');
+}
+
+function drawResult() {
+  text('はんだ付けチャレンジ', W / 2, 44, 28, '#f2f4f6');
+  text(resultT < T_POWER ? '通電テスト' : '検査結果', W / 2, 82, 18, '#aab2ba');
+  if (resultT < T_PANEL) {
+    const msg = resultT < T_POWER ? '電源を入れます…'
+      : ledState === 'on' ? '光った！' : ledState === 'flicker' ? 'チカチカしてる…' : '光らない…';
+    const colr = resultT < T_POWER ? '#ffffff' : ledState === 'on' ? '#7dff8f' : ledState === 'flicker' ? '#ffd34d' : '#ff6a5c';
+    text(msg, W / 2, 620, 36, colr);
+    return;
+  }
+  const t = resultT - T_PANEL;
+  g.globalAlpha = Math.min(1, t / 0.4);
+  rr(40, 540, 520, 244, 18); g.fillStyle = 'rgba(16,18,22,0.92)'; g.fill();
+  g.strokeStyle = 'rgba(255,255,255,0.14)'; g.lineWidth = 2; g.stroke();
+  const shown = Math.round(total * Math.min(1, t / 0.9));
+  text(shown + '点', 150, 586, 56, '#ffffff');
+  if (t > 0.9) {
+    text(rank, 390, 580, rank.length > 5 ? 30 : 38, '#ffd34d');
+    text(comment, W / 2, 628, 19, '#e6eaee', 'center', 'normal');
+    // 壊れた部品だけ診断を出す
+    if (!diag.length) text('全部品 正常', W / 2, 668, 18, '#7dff8f');
+    else {
+      const lines = diag.length <= 3 ? diag : diag.slice(0, 2).concat('ほか' + (diag.length - 2) + '部品も故障');
+      lines.forEach((s, i) => text(s, W / 2, 668 - (lines.length - 1) * 10 + i * 20, 15, '#ff9a8c'));
+    }
+    let b = BTN_RETRY;
+    rr(b.x, b.y, b.w, b.h, 27); g.fillStyle = '#2f9d5c'; g.fill();
+    text('もう一回', b.x + b.w / 2, b.y + 27, 24, '#ffffff');
+    b = BTN_SHARE;
+    rr(b.x, b.y, b.w, b.h, 27); g.fillStyle = '#0f1419'; g.fill();
+    g.strokeStyle = 'rgba(255,255,255,0.55)'; g.lineWidth = 2; g.stroke();
+    text('Xでポスト', b.x + b.w / 2, b.y + 27, 24, '#ffffff');
+  }
+  g.globalAlpha = 1;
+}
+
+// ---------- ループ ----------
+loadBoard('practice');                // タイトルの背景用
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  update(dt);
+  drawBench();
+  drawScene();
+  if (state === 'title') drawTitle();
+  else if (state === 'play') drawHud();
+  else if (state === 'inter') drawInter();
+  else drawResult();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
