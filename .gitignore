@@ -1,3 +1,4 @@
 # 開発用のプレイログと、ローカルの設定は公開しない
 logs/
 .claude/
+thumbs-preview.html

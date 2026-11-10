@@ -188,7 +188,7 @@ function classify(a, br) {
 // ---------- 状態 ----------
 let state = 'title';                  // title | play | inter | result
 let joints = [], idx = 0, sub = 'ready', holdT = 0, afterT = 0;
-let resultT = 0, total = 0, rank = '', comment = '';
+let resultT = 0, total = 0, rank = '', comment = '', slug = 'kami';   // slug: 称号ごとの共有ページ r/<slug>.html
 let partStatus = [], ledState = 'off', diag = [], powered = false;
 let interT = 0, swapped = false, nextKey = 'normal';
 let time = 0, held = false, bannerT = 0;
@@ -337,16 +337,16 @@ function makeResult() {
   const dcBad = board.parts.some((p, i) => p.t === 'D' && partStatus[i] !== 'ok');
   ledState = partStatus.includes('short') || c('none') > 0 || dcBad ? 'off' : partStatus.includes('open') ? 'flicker' : 'on';
 
-  if (c('none') === N) { rank = '見学者'; comment = 'こてが温まる前に帰りました。'; }
-  else if (c('burn') >= N * 0.4) { rank = '放火魔'; comment = '火災報知器が鳴りました。'; }
-  else if (c('bridge') + c('burn') >= N * 0.66) { rank = '一筆書き'; comment = '全部つながりました。回路とは。'; }
-  else if (total >= 100) { rank = '神の手'; comment = '機械より正確。もう機械では？'; }
-  else if (total >= 90) { rank = 'ベテラン職人'; comment = 'このまま出荷できます。'; }
-  else if (total >= 75) { rank = '一人前'; comment = 'ちゃんと動きます。たぶん。'; }
-  else if (total >= 55) { rank = '見習い'; comment = '動く…かもしれない。'; }
-  else if (total >= 35) { rank = '不器用'; comment = '通電はおすすめしません。'; }
-  else if (total >= 15) { rank = '破壊神'; comment = '基板が泣いています。'; }
-  else { rank = '燃えないゴミ'; comment = '基板だったものです。'; }
+  if (c('none') === N) { slug = 'kengaku'; rank = '見学者'; comment = 'こてが温まる前に帰りました。'; }
+  else if (c('burn') >= N * 0.4) { slug = 'houka'; rank = '放火魔'; comment = '火災報知器が鳴りました。'; }
+  else if (c('bridge') + c('burn') >= N * 0.66) { slug = 'hitofude'; rank = '一筆書き'; comment = '全部つながりました。回路とは。'; }
+  else if (total >= 100) { slug = 'kami'; rank = '神の手'; comment = '機械より正確。もう機械では？'; }
+  else if (total >= 90) { slug = 'veteran'; rank = 'ベテラン職人'; comment = 'このまま出荷できます。'; }
+  else if (total >= 75) { slug = 'ichinin'; rank = '一人前'; comment = 'ちゃんと動きます。たぶん。'; }
+  else if (total >= 55) { slug = 'minarai'; rank = '見習い'; comment = '動く…かもしれない。'; }
+  else if (total >= 35) { slug = 'bukiyou'; rank = '不器用'; comment = '通電はおすすめしません。'; }
+  else if (total >= 15) { slug = 'hakai'; rank = '破壊神'; comment = '基板が泣いています。'; }
+  else { slug = 'gomi'; rank = '燃えないゴミ'; comment = '基板だったものです。'; }
   resultT = 0; powered = false; state = 'result';
   sendLog();
 }
@@ -430,8 +430,11 @@ const ledWord = () => (ledState === 'on' ? 'LEDが光った！' : ledState === '
 function shareToX() {
   const body = '「はんだ付けチャレンジ」で' + total + '点！\n称号：' + rank + '\n' + ledWord() + '\n#はんだ付けチャレンジ';
   let u = 'https://x.com/intent/post?text=' + encodeURIComponent(body);
-  // 公開後は、このページのURLを投稿に付ける（手元のファイルや開発用サーバーのときは付けない）
-  if (location.protocol === 'https:') u += '&url=' + encodeURIComponent(location.origin + location.pathname);
+  // 公開後は、称号ごとの共有ページのURLを付ける（サムネイルが称号で変わる。開くとゲームに移動する）
+  // 手元のファイルや開発用サーバーのときは付けない
+  if (location.protocol === 'https:') {
+    u += '&url=' + encodeURIComponent(location.origin + location.pathname.replace(/[^/]*$/, '') + 'r/' + slug + '.html');
+  }
   window.open(u, '_blank', 'noopener');
 }
 function clickResult(sx, sy) {
